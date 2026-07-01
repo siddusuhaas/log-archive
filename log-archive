@@ -5,8 +5,26 @@ PROGRAM_NAME="log-archive"
 ARCHIVE_DIR="${LOG_ARCHIVE_DIR:-archives}"
 LOG_FILE_NAME="archive.log"
 
+KEEP_N=""
+FORMAT="tar.gz"
+EXCLUDE_PATTERNS=()
+EXCLUDE_USED=0
+SCHEDULE_EXPR=""
+SRC_DIR=""
+
 usage() {
-    echo "Usage: ${PROGRAM_NAME} <log-directory>" >&2
+    cat <<'EOF' >&2
+Usage: log-archive [OPTIONS] <log-directory>
+
+Options:
+  -k, --keep N            Keep only the N most recent archives, deleting older ones
+  -f, --format FORMAT     Archive format: tar, tar.gz, tar.bz2, tar.xz (default: tar.gz)
+  -e, --exclude PATTERN   Exclude paths matching a glob PATTERN. Repeatable, or
+                           pipe-separate multiple patterns in one flag: "*.tmp|*.swp"
+      --schedule CRON     Register a crontab entry (5-field expression) that runs
+                           this exact command on a schedule, then exit
+  -h, --help              Show this help and exit
+EOF
 }
 
 die() {
@@ -16,10 +34,264 @@ die() {
     exit "$exit_code"
 }
 
-cleanup_partial_archive() {
-    if [[ -n "${archive_path:-}" && -f "${archive_path:-}" ]]; then
+cleanup() {
+    local status=$?
+    if [[ -n "${file_list_path:-}" && -f "${file_list_path:-}" ]]; then
+        rm -f "$file_list_path"
+    fi
+    if [[ "$status" -ne 0 && -n "${archive_path:-}" && -f "${archive_path:-}" ]]; then
         rm -f "$archive_path"
     fi
+}
+
+add_exclude_pattern() {
+    local raw="$1"
+    EXCLUDE_USED=1
+    [[ -z "$raw" ]] && return 0
+    local IFS='|'
+    local -a parts
+    set -f
+    parts=($raw)
+    set +f
+    local p
+    for p in "${parts[@]}"; do
+        [[ -n "$p" ]] && EXCLUDE_PATTERNS+=("$p")
+    done
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -k|--keep)
+                [[ $# -ge 2 ]] || die 1 "-k/--keep requires a value"
+                KEEP_N="$2"
+                shift 2
+                ;;
+            --keep=*)
+                KEEP_N="${1#*=}"
+                shift
+                ;;
+            -f|--format)
+                [[ $# -ge 2 ]] || die 1 "-f/--format requires a value"
+                FORMAT="$2"
+                shift 2
+                ;;
+            --format=*)
+                FORMAT="${1#*=}"
+                shift
+                ;;
+            -e|--exclude)
+                [[ $# -ge 2 ]] || die 1 "-e/--exclude requires a value"
+                add_exclude_pattern "$2"
+                shift 2
+                ;;
+            --exclude=*)
+                add_exclude_pattern "${1#*=}"
+                shift
+                ;;
+            --schedule)
+                [[ $# -ge 2 ]] || die 1 "--schedule requires a cron expression"
+                SCHEDULE_EXPR="$2"
+                shift 2
+                ;;
+            --schedule=*)
+                SCHEDULE_EXPR="${1#*=}"
+                shift
+                ;;
+            --)
+                shift
+                if [[ $# -gt 0 ]]; then
+                    [[ -z "$SRC_DIR" ]] || die 1 "unexpected extra argument: $1"
+                    SRC_DIR="$1"
+                    shift
+                fi
+                ;;
+            -*)
+                die 1 "unknown option: $1"
+                ;;
+            *)
+                [[ -z "$SRC_DIR" ]] || die 1 "unexpected extra argument: $1"
+                SRC_DIR="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+validate_cron_expr() {
+    local expr="$1"
+    local -a fields
+    read -r -a fields <<< "$expr"
+    [[ "${#fields[@]}" -eq 5 ]] || return 1
+    local field_re='^(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?(,(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?)*$'
+    local f
+    for f in "${fields[@]}"; do
+        [[ "$f" =~ $field_re ]] || return 1
+    done
+    return 0
+}
+
+validate_args() {
+    if [[ -n "$KEEP_N" ]]; then
+        [[ "$KEEP_N" =~ ^[0-9]+$ ]] || die 1 "-k/--keep must be a positive integer, got '$KEEP_N'"
+        [[ "$KEEP_N" -ge 1 ]] || die 1 "-k/--keep must be at least 1"
+    fi
+
+    case "$FORMAT" in
+        tar|tar.gz|tar.bz2|tar.xz) ;;
+        *) die 1 "invalid format '$FORMAT' (expected: tar, tar.gz, tar.bz2, tar.xz)" ;;
+    esac
+
+    if [[ "$EXCLUDE_USED" -eq 1 && "${#EXCLUDE_PATTERNS[@]}" -eq 0 ]]; then
+        die 1 "no valid exclude patterns provided"
+    fi
+
+    if [[ -n "$SCHEDULE_EXPR" ]]; then
+        validate_cron_expr "$SCHEDULE_EXPR" \
+            || die 1 "invalid cron expression '$SCHEDULE_EXPR' (expected 5 fields: minute hour day month weekday)"
+    fi
+
+    if [[ -z "$SRC_DIR" ]]; then
+        usage
+        exit 1
+    fi
+}
+
+resolve_src_dir() {
+    local dir="$1"
+    if [[ ! -e "$dir" ]]; then
+        die 2 "directory '$dir' does not exist"
+    fi
+    if [[ ! -d "$dir" ]]; then
+        die 2 "'$dir' is not a directory"
+    fi
+    if [[ ! -r "$dir" ]]; then
+        die 2 "directory '$dir' is not readable"
+    fi
+    abs_src_dir="$(cd "$dir" && pwd)"
+}
+
+is_excluded() {
+    [[ "${#EXCLUDE_PATTERNS[@]}" -eq 0 ]] && return 1
+    local rel="$1" pattern
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        [[ "$rel" == $pattern ]] && return 0
+    done
+    return 1
+}
+
+# Walks abs_src_dir, writes archive-relative "./path" entries (minus excluded
+# ones) to a temp file consumed by `tar -T`, and tallies counts + symlinks.
+build_file_list() {
+    file_list_path="$(mktemp)"
+    file_count=0
+    included_count=0
+    excluded_count=0
+    symlinks=()
+
+    local entry rel
+    while IFS= read -r -d '' entry; do
+        file_count=$((file_count + 1))
+        [[ -L "$entry" ]] && symlinks+=("$entry")
+
+        rel="${entry#"$abs_src_dir"/}"
+        if is_excluded "$rel"; then
+            excluded_count=$((excluded_count + 1))
+            continue
+        fi
+        included_count=$((included_count + 1))
+        printf './%s\n' "$rel" >> "$file_list_path"
+    done < <(find "$abs_src_dir" \( -type f -o -type l \) -print0)
+}
+
+run_tar() {
+    local tar_flag=""
+    case "$FORMAT" in
+        tar.gz)  tar_flag="z" ;;
+        tar.bz2) tar_flag="j" ;;
+        tar.xz)  tar_flag="J" ;;
+        tar)     tar_flag="" ;;
+    esac
+
+    if [[ "$FORMAT" == "tar.bz2" || "$FORMAT" == "tar.xz" ]]; then
+        echo "Using ${FORMAT} (slower but better compression)" >&2
+    fi
+
+    if ! tar -c${tar_flag}f "$archive_path" -C "$abs_src_dir" -T "$file_list_path"; then
+        die 4 "tar failed to create archive"
+    fi
+}
+
+# Deletes all but the N most recent logs_archive_* files in ARCHIVE_DIR.
+# Filenames embed YYYYMMDD_HHMMSS, so a plain lexicographic sort is already
+# a correct chronological sort.
+cleanup_old_archives() {
+    local keep="$1"
+    local -a candidates=()
+    while IFS= read -r -d '' f; do
+        candidates+=("$f")
+    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -type f -name 'logs_archive_*.tar*' -print0)
+
+    [[ "${#candidates[@]}" -le "$keep" ]] && return 0
+
+    local -a sorted=()
+    while IFS= read -r f; do
+        sorted+=("$f")
+    done < <(printf '%s\n' "${candidates[@]}" | sort -r)
+
+    local deleted=0 freed=0 path size
+    for path in "${sorted[@]:keep}"; do
+        size="$(wc -c < "$path" | tr -d ' ')"
+        rm -f "$path"
+        freed=$((freed + size))
+        deleted=$((deleted + 1))
+        printf '%s | CLEANUP | deleted %s | freed %s bytes\n' \
+            "$(date +"%Y-%m-%d %H:%M:%S")" "$(basename "$path")" "$size" \
+            >> "${ARCHIVE_DIR}/${LOG_FILE_NAME}"
+    done
+
+    echo "Cleaned up ${deleted} old archive(s), freed ${freed} bytes"
+}
+
+schedule_cron() {
+    command -v crontab >/dev/null 2>&1 || die 1 "crontab command not found"
+
+    local bin_path
+    bin_path="$(command -v "$PROGRAM_NAME")" \
+        || die 1 "${PROGRAM_NAME} not found in PATH; run 'make install' first"
+
+    resolve_src_dir "$SRC_DIR"
+
+    local -a cmd_parts=("$bin_path")
+    [[ -n "$KEEP_N" ]] && cmd_parts+=("-k" "$KEEP_N")
+    [[ "$FORMAT" != "tar.gz" ]] && cmd_parts+=("-f" "$FORMAT")
+    local p
+    if [[ "${#EXCLUDE_PATTERNS[@]}" -gt 0 ]]; then
+        for p in "${EXCLUDE_PATTERNS[@]}"; do
+            cmd_parts+=("-e" "$p")
+        done
+    fi
+    cmd_parts+=("$abs_src_dir")
+
+    local cron_line comment_line existing
+    cron_line="${SCHEDULE_EXPR} $(printf '%s ' "${cmd_parts[@]}")>/dev/null 2>&1"
+    comment_line="# log-archive scheduled job"
+    existing="$(crontab -l 2>/dev/null || true)"
+
+    if grep -qF "$cron_line" <<< "$existing"; then
+        die 1 "a crontab entry for this exact command already exists"
+    fi
+
+    { [[ -n "$existing" ]] && printf '%s\n' "$existing"; printf '%s\n%s\n' "$comment_line" "$cron_line"; } \
+        | crontab -
+
+    echo "Scheduled log-archive via crontab:"
+    echo "  ${cron_line}"
+    echo "To remove it later, run 'crontab -e' and delete the lines above."
 }
 
 main() {
@@ -28,47 +300,38 @@ main() {
         exit 1
     fi
 
-    local src_dir="$1"
+    parse_args "$@"
+    validate_args
 
-    if [[ ! -e "$src_dir" ]]; then
-        die 2 "directory '$src_dir' does not exist"
-    fi
-    if [[ ! -d "$src_dir" ]]; then
-        die 2 "'$src_dir' is not a directory"
-    fi
-    if [[ ! -r "$src_dir" ]]; then
-        die 2 "directory '$src_dir' is not readable"
+    if [[ -n "$SCHEDULE_EXPR" ]]; then
+        schedule_cron
+        exit 0
     fi
 
-    local abs_src_dir
-    abs_src_dir="$(cd "$src_dir" && pwd)"
+    resolve_src_dir "$SRC_DIR"
 
     mkdir -p "$ARCHIVE_DIR" || die 4 "failed to create archive directory '$ARCHIVE_DIR'"
 
-    local timestamp human_timestamp archive_name archive_path
+    local timestamp human_timestamp archive_name
     timestamp="$(date +%Y%m%d_%H%M%S)"
     human_timestamp="$(date +"%Y-%m-%d %H:%M:%S")"
-    archive_name="logs_archive_${timestamp}.tar.gz"
+    archive_name="logs_archive_${timestamp}.${FORMAT}"
     archive_path="${ARCHIVE_DIR}/${archive_name}"
 
-    trap cleanup_partial_archive ERR
+    trap cleanup EXIT
 
-    # Count files (and symlinks, which tar stores as links rather than
-    # following) so archive.log reflects what actually ended up in the tar.
-    local file_count=0
-    local -a symlinks=()
-    while IFS= read -r -d '' entry; do
-        file_count=$((file_count + 1))
-        if [[ -L "$entry" ]]; then
-            symlinks+=("$entry")
-        fi
-    done < <(find "$abs_src_dir" \( -type f -o -type l \) -print0)
+    build_file_list
 
     if [[ "${#symlinks[@]}" -gt 0 ]]; then
         echo "Warning: ${#symlinks[@]} symlink(s) found; archiving as links (not following targets):" >&2
+        local link
         for link in "${symlinks[@]}"; do
             echo "  $link" >&2
         done
+    fi
+
+    if [[ "$EXCLUDE_USED" -eq 1 && "$file_count" -gt 0 && "$included_count" -eq 0 ]]; then
+        echo "Warning: exclude patterns matched every file; archive will contain no files" >&2
     fi
 
     # Disk space check: logs typically compress >50%, so require free space
@@ -80,22 +343,34 @@ main() {
         die 3 "insufficient disk space: need ~$((required_kb / 2))KB free, have ${available_kb}KB"
     fi
 
-    # -C + relative "." keeps archive members as ./relative/paths with no
-    # leading slash, so extraction never writes outside the target dir.
-    if ! tar -czf "$archive_path" -C "$abs_src_dir" .; then
-        die 4 "tar failed to create archive"
+    run_tar
+
+    local archive_size ratio
+    archive_size="$(wc -c < "$archive_path" | tr -d ' ')"
+    ratio="0.0"
+    if [[ "$required_kb" -gt 0 ]]; then
+        ratio="$(awk -v s="$((required_kb * 1024))" -v a="$archive_size" 'BEGIN { printf "%.1f", (1 - a / s) * 100 }')"
     fi
 
-    local archive_size
-    archive_size="$(wc -c < "$archive_path" | tr -d ' ')"
+    local files_field
+    if [[ "$EXCLUDE_USED" -eq 1 ]]; then
+        files_field="${included_count} files archived | ${excluded_count} excluded"
+    else
+        files_field="${included_count} files"
+    fi
 
-    printf '%s | %s | %s | %s files | %s bytes\n' \
-        "$human_timestamp" "$abs_src_dir" "$archive_name" "$file_count" "$archive_size" \
+    printf '%s | %s | %s | %s | %s bytes | format: %s\n' \
+        "$human_timestamp" "$abs_src_dir" "$archive_name" "$files_field" "$archive_size" "$FORMAT" \
         >> "${ARCHIVE_DIR}/${LOG_FILE_NAME}"
 
-    trap - ERR
+    local summary="Created archive: ${archive_path} (${included_count} files"
+    [[ "$EXCLUDE_USED" -eq 1 ]] && summary+=", ${excluded_count} excluded"
+    summary+=", ${archive_size} bytes, ${ratio}% smaller than source)"
+    echo "$summary"
 
-    echo "Created archive: ${archive_path} (${file_count} files, ${archive_size} bytes)"
+    if [[ -n "$KEEP_N" ]]; then
+        cleanup_old_archives "$KEEP_N"
+    fi
 }
 
 main "$@"
