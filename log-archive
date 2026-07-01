@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM_NAME="log-archive"
+ARCHIVE_DIR="${LOG_ARCHIVE_DIR:-archives}"
+LOG_FILE_NAME="archive.log"
+
+usage() {
+    echo "Usage: ${PROGRAM_NAME} <log-directory>" >&2
+}
+
+die() {
+    local exit_code="$1"
+    shift
+    echo "Error: $*" >&2
+    exit "$exit_code"
+}
+
+cleanup_partial_archive() {
+    if [[ -n "${archive_path:-}" && -f "${archive_path:-}" ]]; then
+        rm -f "$archive_path"
+    fi
+}
+
+main() {
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 1
+    fi
+
+    local src_dir="$1"
+
+    if [[ ! -e "$src_dir" ]]; then
+        die 2 "directory '$src_dir' does not exist"
+    fi
+    if [[ ! -d "$src_dir" ]]; then
+        die 2 "'$src_dir' is not a directory"
+    fi
+    if [[ ! -r "$src_dir" ]]; then
+        die 2 "directory '$src_dir' is not readable"
+    fi
+
+    local abs_src_dir
+    abs_src_dir="$(cd "$src_dir" && pwd)"
+
+    mkdir -p "$ARCHIVE_DIR" || die 4 "failed to create archive directory '$ARCHIVE_DIR'"
+
+    local timestamp human_timestamp archive_name archive_path
+    timestamp="$(date +%Y%m%d_%H%M%S)"
+    human_timestamp="$(date +"%Y-%m-%d %H:%M:%S")"
+    archive_name="logs_archive_${timestamp}.tar.gz"
+    archive_path="${ARCHIVE_DIR}/${archive_name}"
+
+    trap cleanup_partial_archive ERR
+
+    # Count files (and symlinks, which tar stores as links rather than
+    # following) so archive.log reflects what actually ended up in the tar.
+    local file_count=0
+    local -a symlinks=()
+    while IFS= read -r -d '' entry; do
+        file_count=$((file_count + 1))
+        if [[ -L "$entry" ]]; then
+            symlinks+=("$entry")
+        fi
+    done < <(find "$abs_src_dir" \( -type f -o -type l \) -print0)
+
+    if [[ "${#symlinks[@]}" -gt 0 ]]; then
+        echo "Warning: ${#symlinks[@]} symlink(s) found; archiving as links (not following targets):" >&2
+        for link in "${symlinks[@]}"; do
+            echo "  $link" >&2
+        done
+    fi
+
+    # Disk space check: logs typically compress >50%, so require free space
+    # equal to at least half the source size before starting.
+    local required_kb available_kb
+    required_kb="$(du -sk "$abs_src_dir" 2>/dev/null | cut -f1)"
+    available_kb="$(df -Pk "$ARCHIVE_DIR" | tail -1 | awk '{print $4}')"
+    if [[ "$available_kb" -lt $((required_kb / 2)) ]]; then
+        die 3 "insufficient disk space: need ~$((required_kb / 2))KB free, have ${available_kb}KB"
+    fi
+
+    # -C + relative "." keeps archive members as ./relative/paths with no
+    # leading slash, so extraction never writes outside the target dir.
+    if ! tar -czf "$archive_path" -C "$abs_src_dir" .; then
+        die 4 "tar failed to create archive"
+    fi
+
+    local archive_size
+    archive_size="$(wc -c < "$archive_path" | tr -d ' ')"
+
+    printf '%s | %s | %s | %s files | %s bytes\n' \
+        "$human_timestamp" "$abs_src_dir" "$archive_name" "$file_count" "$archive_size" \
+        >> "${ARCHIVE_DIR}/${LOG_FILE_NAME}"
+
+    trap - ERR
+
+    echo "Created archive: ${archive_path} (${file_count} files, ${archive_size} bytes)"
+}
+
+main "$@"
